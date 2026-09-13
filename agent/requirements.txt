@@ -1,0 +1,16 @@
+livekit-agents[deepgram,cartesia,elevenlabs,anthropic,openai,silero]~=1.5
+livekit-plugins-turn-detector~=1.5
+
+# Direct SDK clients (in addition to the livekit-plugins-* wrappers above)
+# used for one-shot call summarization in src/summarize.py, which happens
+# after the streaming AgentSession has already ended — see that file's
+# module docstring for why it doesn't reuse the session's LLM plugin instance.
+anthropic~=0.40
+openai~=1.55
+
+supabase~=2.9
+pydantic~=2.9
+python-dotenv~=1.0
+
+pytest~=8.3
+pytest-asyncio~=0.24

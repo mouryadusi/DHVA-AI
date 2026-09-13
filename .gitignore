@@ -1,0 +1,23 @@
+# Node / Next.js
+node_modules/
+.next/
+out/
+.vercel
+
+# Env
+.env
+.env.local
+.env*.local
+agent/.env
+
+# Python
+agent/.venv/
+agent/__pycache__/
+agent/**/__pycache__/
+*.pyc
+.pytest_cache/
+
+# Misc
+.DS_Store
+*.log
+coverage/

@@ -143,7 +143,132 @@ accounts regardless of dev environment):
 **Do not claim the real phone test works until `docs/PHONE_TEST.md` has
 actually been run against real accounts and all four of its tests pass.**
 
-## What changed in the most recent pass (competitive research + needs-review + rate limiting)
+## What changed in this pass (the missing "place order" persistence gap)
+
+A fresh audit — not a continuation of assumptions — found the single
+highest-value real gap: `calculate_order` computed a total and the call got
+classified `outcome = 'order_placed'`, but **nothing was ever persisted**.
+No order record existed anywhere a business owner could see it. This
+directly violated the product's own standard ("never claim an action
+succeeded unless the tool confirms it") — there was no real confirmation
+to check.
+
+Fixed with a real feature, not a relabeling:
+- **`supabase/migrations/0007_orders.sql`** — `orders` + `order_items`
+  tables, RLS scoped through `is_business_member()`, line items snapshot
+  product name/price at order time (survives later menu changes). Business
+  owners get update access (unlike `calls`, which stay read-only from the
+  dashboard) since marking an order's status is a real expected workflow.
+- **New `place_order` tool** (`agent/src/entrypoint.py`) — separate from
+  `calculate_order`, which stays a pure preview with no side effects.
+  `place_order` re-validates prices server-side rather than trusting
+  anything claimed earlier in the conversation, and only returns
+  `"confirmed"` after the DB write actually succeeds.
+- **Fixed `agent/src/outcome.py`**: `order_placed` now requires `place_order`
+  to have actually succeeded — previously it fired on `calculate_order`
+  alone, meaning "Customer Opportunities Saved" could count calls where no
+  order existed in the database at all. `calculate_order` now correctly
+  lands in `answered_faq` (informational, no commitment).
+- **Fixed a real latent bug found while wiring this in**: `customer_id`
+  was computed in `entrypoint()` but never actually passed to `DhvaAgent`
+  — it was always `None` regardless of whether a real customer existed.
+- Call detail page now shows the order (items, total, status) with an
+  inline status-update control.
+- New tests: `tests/orders-migration.test.ts` (10 assertions, all
+  confirmed to match the real SQL), and `agent/tests/test_outcome.py`
+  updated and **actually executed directly** against the real `outcome.py`
+  module (it has zero external dependencies, so this ran for real, not
+  just as a syntax check) — 10/10 pass.
+
+## What changed in the pass before that (error taxonomy + a real bug found while wiring it in)
+
+Implemented `phase_15`'s error taxonomy from the master build request —
+the item flagged as the evidence-based next step in the prior pass. In
+the process of wiring it into `tool_executions`, found and fixed a real
+bug, not a hypothetical one:
+
+- **Bug**: `calculate_order` and `request_human_transfer`'s failure paths
+  caught their own exceptions (or never raised one) *inside* the
+  `with timed_tool_call(...)` block and returned without re-raising. That
+  meant `timed_tool_call`'s own exception handler never fired, so these
+  failures were being persisted to `tool_executions` as `success = true`
+  — even though the LLM correctly saw the failure and `self.tool_calls`
+  (used for outcome classification) correctly tracked it. The bug was
+  specifically in the *audit trail*, not in what the caller experienced.
+- **Fix**: `timed_tool_call` (`agent/src/call_logging.py`) now accepts an
+  explicit `record["success"] = False` override with
+  `record["error_category"]` / `record["error_message"]`, for the
+  legitimate case of a failure that isn't an exception (e.g. "no
+  escalation number configured" — the tool ran correctly and determined
+  the action can't happen). All four failure sites in `entrypoint.py`
+  (`calculate_order`, and three paths in `request_human_transfer`) updated
+  to use it.
+- **New**: `agent/src/errors.py` (14-category `ErrorCategory` enum +
+  `DhvaError` + best-effort `categorize_unknown_exception` for
+  third-party SDK exceptions), `agent/src/logging_utils.py` (structured
+  JSON logging with call_id/business_id correlation fields and secret
+  redaction — verified redaction actually works against a real log line,
+  not just asserted), `supabase/migrations/0007_error_taxonomy.sql`
+  (adds `tool_executions.error_category`, added `NOT VALID` deliberately
+  so it can't break on existing failed rows from before this migration).
+- Replaced the plain-string `logger.exception(...)` calls in the transfer
+  path and top-level call-failure handler with categorized structured
+  events. Also fixed a minor privacy improvement as a side effect: the
+  old transfer log line included the handoff summary text (conversation
+  excerpt) in a log message; the new structured event deliberately omits it.
+
+**Verification note, unusually strong for this pass**: `agent/src/errors.py`
+and `agent/src/logging_utils.py` have zero external dependencies (pure
+stdlib — no pydantic/supabase), so I could actually *execute* them in this
+sandbox despite no network access, not just syntax-check them. Ran all 14
+category values, the context-based categorization heuristics, nested-dict
+redaction, and a real captured log line through actual Python execution —
+shown in this session's tool output. This is genuinely VERIFIED LOCALLY,
+not IMPLEMENTED BUT NOT VERIFIED, for those two files specifically.
+
+## What changed in the pass before that (repository audit against the 40-phase master build request)
+
+Given the scope of that request (40 phases covering a full product rewrite),
+I audited the actual repository first rather than assuming prior
+descriptions were accurate — per that document's own "repository is the
+source of truth" principle. Two migrations (`0005`, `0006`) already existed
+in the repo from work not reflected in this file yet. Findings:
+
+- **`0006_fix_provisioning_race_and_updated_at.sql` is real and correct**:
+  it fixes the check-then-insert race in `provision_starter_business`
+  properly — a genuine `unique(org_id)` constraint on `businesses` plus
+  `exception when unique_violation` recovery (insert-and-recover, not
+  check-then-act), and adds `updated_at` + triggers to the five mutable
+  Business Brain tables. This was previously undocumented here and had
+  **zero test coverage** — added `tests/provisioning-race-fix.test.ts`,
+  verified all 9 assertions actually match the real SQL (shown in this
+  session's tool output, not assumed).
+- **The 0005 rate limiter is genuinely wired in**, not just defined in
+  SQL — confirmed `app/api/livekit/token/route.ts` actually calls
+  `check_and_record_token_mint` and fails closed (429) on a real limit hit,
+  fails open (logged) only on an infra error. Already correct, no changes needed.
+- **Prompt-injection defense block is still intact** in
+  `agent/src/business_brain.py`'s `build_system_prompt` — confirmed present,
+  not regressed.
+
+I did not attempt the full 40-phase rewrite in this pass — see the note at
+the end of this section. What I did do: verify what's claimed vs. what's
+real for the highest-risk items (concurrency, security wiring), fix the one
+real gap found (missing test coverage for 0006), and leave an honest map of
+what's actually P0-complete vs. still open.
+
+**Full 40-phase scope note:** that request is a complete product rewrite
+across database, AI architecture, voice, observability, security,
+frontend, testing, and competitive strategy — each phase individually is
+a multi-day-plus effort done properly. Executing all 40 with genuine
+verification in one pass isn't possible without fabricating completion,
+which that document itself explicitly forbids ("do not fake completeness
+... do not fabricate verification"). The honest path is incremental: audit
+→ fix the highest-value real gap → verify it → repeat, which is what this
+pass and the ones before it have actually done. See "Known gaps" below for
+what's still genuinely open against that document's P0 list.
+
+## What changed in the pass before that (competitive research + needs-review + rate limiting)
 
 Did NOT restart or repeat prior investigation — auth/RLS/token fixes from
 prior passes are unchanged and assumed working per their own VERIFIED

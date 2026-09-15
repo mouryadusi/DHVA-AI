@@ -112,6 +112,24 @@ connection alive past the point the call itself has ended.
 is a raw transcript excerpt clearly labeled `[Auto-summary unavailable]` —
 never silently presented as if it were a real summary.
 
+## ADR-9: Provisioning is idempotent via a unique constraint, not an application-level check
+
+**Decision:** `businesses.org_id` has a unique constraint;
+`provision_starter_business` catches `unique_violation` and returns the
+existing business rather than treating concurrent calls as an error.
+
+**Why:** The prior version did check-then-insert (`if exists (...) then
+raise exception`), which is a real TOCTOU race under concurrent
+invocation — two nearly-simultaneous calls (a double-clicked recovery
+button, a retried RPC) could both pass the check before either commits.
+A database constraint is the only thing that's actually safe under true
+concurrency; catching the resulting error and recovering gracefully is
+what makes the operation idempotent rather than merely usually-fine.
+
+**Consequence:** any future "one X per Y" invariant in this schema should
+default to a real constraint, not an `if exists` guard — the pattern
+established here.
+
 ## Open decisions / explicitly not yet made
 
 - Whether a second vertical shares the Telnyx SIP trunk/dispatch rule

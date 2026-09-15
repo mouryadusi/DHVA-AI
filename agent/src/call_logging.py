@@ -81,6 +81,7 @@ def log_tool_execution(
     success: bool,
     error_message: Optional[str] = None,
     latency_ms: Optional[int] = None,
+    error_category: Optional[str] = None,
 ) -> None:
     sb = get_supabase()
     sb.table("tool_executions").insert(
@@ -92,6 +93,7 @@ def log_tool_execution(
             "success": success,
             "error_message": error_message,
             "latency_ms": latency_ms,
+            "error_category": error_category,
         }
     ).execute()
 
@@ -128,6 +130,56 @@ def write_call_summary(call_id: str, summary_text: str, opportunity_saved: bool)
     ).execute()
 
 
+def place_order(
+    business_id: str,
+    call_id: str,
+    customer_id: Optional[str],
+    line_items: list[dict[str, Any]],
+    total_cents: int,
+    fulfillment_type: str = "pickup",
+    notes: Optional[str] = None,
+) -> str:
+    """
+    Persists a real order record. Called from the `place_order` tool
+    (agent/src/entrypoint.py) AFTER server-side re-validation via
+    agent/src/tools/order.py::calculate_order — never called with a total
+    the LLM computed or claimed itself. Returns the order id, which is
+    also usable as a caller-facing reference number.
+    """
+    sb = get_supabase()
+    order = (
+        sb.table("orders")
+        .insert(
+            {
+                "business_id": business_id,
+                "call_id": call_id,
+                "customer_id": customer_id,
+                "fulfillment_type": fulfillment_type,
+                "total_cents": total_cents,
+                "notes": notes,
+            }
+        )
+        .execute()
+    )
+    order_id = order.data[0]["id"]
+
+    sb.table("order_items").insert(
+        [
+            {
+                "order_id": order_id,
+                "product_id": li["product_id"],
+                "product_name": li["name"],
+                "unit_price_cents": li["unit_price_cents"],
+                "quantity": li["quantity"],
+                "line_total_cents": li["line_total_cents"],
+            }
+            for li in line_items
+        ]
+    ).execute()
+
+    return order_id
+
+
 @contextmanager
 def timed_tool_call(call_id: str, tool_name: str, input_json: dict[str, Any]):
     """
@@ -136,23 +188,45 @@ def timed_tool_call(call_id: str, tool_name: str, input_json: dict[str, Any]):
             result = do_the_thing()
             record["output"] = result
     Automatically logs success/failure and latency to tool_executions.
+
+    By default, success/failure is inferred from whether an exception
+    propagated out of the `with` block. Some tool outcomes are legitimate
+    failures without an exception (e.g. "no escalation number configured" —
+    the tool ran correctly and determined the action can't be taken) — set
+    record["success"] = False explicitly for these, plus optionally
+    record["error_category"] (an ErrorCategory value) and
+    record["error_message"]. This was added specifically because several
+    call sites were catching their own exceptions internally and returning
+    without re-raising, which meant this context manager's except branch
+    never fired and the failure got persisted to tool_executions as
+    success=true — a real bug found during a fresh audit, not a
+    hypothetical one. If you're tempted to catch-and-swallow inside a
+    `with timed_tool_call(...)` block, use the explicit override instead.
     """
     t0 = time.monotonic()
-    record: dict[str, Any] = {"output": None}
-    error: Optional[str] = None
+    record: dict[str, Any] = {"output": None, "error_category": None, "success": None, "error_message": None}
+    exception_message: Optional[str] = None
     try:
         yield record
     except Exception as e:  # noqa: BLE001 — intentionally broad; this is a logging boundary
-        error = str(e)
+        exception_message = str(e)
+        if record.get("error_category") is None:
+            from src.errors import categorize_unknown_exception
+
+            record["error_category"] = categorize_unknown_exception(e, context=tool_name).value
         raise
     finally:
         latency_ms = int((time.monotonic() - t0) * 1000)
+        explicit_success = record.get("success")
+        success = explicit_success if explicit_success is not None else (exception_message is None)
+        error_message = exception_message or (None if success else record.get("error_message"))
         log_tool_execution(
             call_id=call_id,
             tool_name=tool_name,
             input_json=input_json,
             output_json=record.get("output"),
-            success=error is None,
-            error_message=error,
+            success=success,
+            error_message=error_message,
             latency_ms=latency_ms,
+            error_category=record.get("error_category") if not success else None,
         )

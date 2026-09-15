@@ -33,10 +33,13 @@ from src.call_logging import (
     create_call_record,
     finalize_call,
     get_or_create_customer,
+    place_order as place_order_db,
     timed_tool_call,
     write_call_summary,
 )
 from src.outcome import classify_outcome, is_review_worthy_reason
+from src.errors import ErrorCategory, categorize_unknown_exception
+from src.logging_utils import log_event, log_error
 from src.summarize import generate_call_summary
 from src.tools.hours import is_open_now, get_business_info
 from src.tools.menu import search_menu
@@ -165,10 +168,11 @@ class DhvaAgent(Agent):
     Agent instance — see entrypoint() for what it actually does.
     """
 
-    def __init__(self, brain: BusinessBrain, call_id: str, transfer_fn):
+    def __init__(self, brain: BusinessBrain, call_id: str, transfer_fn, customer_id: Optional[str] = None):
         super().__init__(instructions=build_system_prompt(brain))
         self.brain = brain
         self.call_id = call_id
+        self.customer_id = customer_id
         self._transfer_fn = transfer_fn
         self._message_sequence = 0
         self._transcript_lines: list[str] = []
@@ -232,10 +236,84 @@ class DhvaAgent(Agent):
                 self._record_tool_call("calculate_order", success=True)
                 return result
             except OrderError as e:
+                # Explicit override, not a swallowed exception — see
+                # timed_tool_call's docstring. Previously this branch
+                # returned without re-raising, which meant the failure was
+                # (incorrectly) persisted to tool_executions as success=true.
+                record["success"] = False
+                record["error_message"] = str(e)
+                record["error_category"] = ErrorCategory.VALIDATION_ERROR.value
                 record["output"] = {"error": str(e)}
                 self._record_tool_call("calculate_order", success=False)
                 self.review_signals.append(f"Order calculation failed: {e}")
                 return {"error": str(e)}
+
+    @function_tool
+    async def place_order(
+        self, context: RunContext, items: list[dict], fulfillment_type: str = "pickup"
+    ) -> dict:
+        """
+        Actually places the order — only call this AFTER the caller has
+        explicitly confirmed the items and total from calculate_order.
+        items: list of {"product_id": str, "quantity": int}.
+        fulfillment_type: "pickup" or "delivery".
+
+        Re-validates prices server-side from the current menu rather than
+        trusting any total mentioned earlier in the conversation. Never
+        tell the caller their order is placed until this tool returns
+        status "confirmed" — if it returns "failed", apologize and offer
+        to take a message instead; do not claim success.
+        """
+        with timed_tool_call(
+            self.call_id, "place_order", {"items": items, "fulfillment_type": fulfillment_type}
+        ) as record:
+            try:
+                calc = calculate_order(self.brain, items)  # authoritative re-check, never reused from earlier
+            except OrderError as e:
+                record["success"] = False
+                record["error_message"] = str(e)
+                record["error_category"] = ErrorCategory.VALIDATION_ERROR.value
+                record["output"] = {"error": str(e)}
+                self._record_tool_call("place_order", success=False)
+                self.review_signals.append(f"place_order rejected by validation: {e}")
+                return {
+                    "status": "failed",
+                    "message": f"Could not place the order: {e}. Do not tell the caller it succeeded.",
+                }
+
+            safe_fulfillment = fulfillment_type if fulfillment_type in ("pickup", "delivery") else "pickup"
+
+            try:
+                order_id = place_order_db(
+                    business_id=self.brain.business_id,
+                    call_id=self.call_id,
+                    customer_id=self.customer_id,
+                    line_items=calc["line_items"],
+                    total_cents=calc["total_cents"],
+                    fulfillment_type=safe_fulfillment,
+                )
+            except Exception as e:  # noqa: BLE001 — a DB write failure here must not crash the call
+                record["success"] = False
+                record["error_message"] = str(e)
+                record["error_category"] = ErrorCategory.DATABASE_ERROR.value
+                record["output"] = {"error": str(e)}
+                self._record_tool_call("place_order", success=False)
+                self.review_signals.append(f"place_order DB write failed: {e}")
+                return {
+                    "status": "failed",
+                    "message": "The order could not be saved due to a system error. Apologize, and "
+                    "offer to take a message with the order details instead. "
+                    "Do not tell the caller the order was placed.",
+                }
+
+            record["output"] = {"order_id": order_id, "total_cents": calc["total_cents"]}
+            self._record_tool_call("place_order", success=True)
+            return {
+                "status": "confirmed",
+                "order_id": order_id,
+                "total_cents": calc["total_cents"],
+                "message": f"Order confirmed. Reference number: {order_id[:8]}.",
+            }
 
     @function_tool
     async def take_message(self, context: RunContext, caller_name: str | None, message: str) -> dict:
@@ -269,11 +347,17 @@ class DhvaAgent(Agent):
 
             if decision is None:
                 record["output"] = {"transferred": False, "reason": "trigger not configured for escalation"}
+                record["success"] = False
+                record["error_category"] = ErrorCategory.VALIDATION_ERROR.value
+                record["error_message"] = f"Escalation trigger '{reason}' is not configured for this business"
                 self._record_tool_call("request_human_transfer", success=False)
                 return {"status": "cannot_transfer", "message": "Continue helping the caller yourself."}
 
             if not self.brain.agent.escalation_phone_number:
                 record["output"] = {"transferred": False, "reason": "no escalation number configured"}
+                record["success"] = False
+                record["error_category"] = ErrorCategory.ONBOARDING_ERROR.value
+                record["error_message"] = "No escalation_phone_number configured for this business"
                 self._record_tool_call("request_human_transfer", success=False)
                 self.review_signals.append("Caller needed human transfer but no transfer number is configured")
                 return {
@@ -285,6 +369,10 @@ class DhvaAgent(Agent):
             transfer_succeeded = await self._transfer_fn(self.brain.agent.escalation_phone_number, summary)
 
             record["output"] = {"transferred": transfer_succeeded, "summary": summary}
+            record["success"] = transfer_succeeded
+            if not transfer_succeeded:
+                record["error_category"] = ErrorCategory.TELEPHONY_ERROR.value
+                record["error_message"] = "SIP transfer did not complete — see agent worker logs for the specific exception"
             self._record_tool_call("request_human_transfer", success=transfer_succeeded)
 
             if transfer_succeeded:
@@ -325,6 +413,10 @@ async def entrypoint(ctx: JobContext) -> None:
         from_number=from_number,
         customer_id=customer_id,
     )
+    log_event(
+        "call_started", call_id=call_id, business_id=business_id,
+        room_name=ctx.room.name, has_caller_number=from_number is not None,
+    )
 
     call_start = time.monotonic()
 
@@ -343,7 +435,10 @@ async def entrypoint(ctx: JobContext) -> None:
         fail-safe direction.
         """
         if not sip_participant_identity:
-            logger.warning("Cannot transfer: no SIP participant found (likely a browser test session)")
+            log_event(
+                "transfer_skipped", call_id=call_id, business_id=business_id,
+                reason="no_sip_participant", level=logging.WARNING,
+            )
             return False
         try:
             from livekit import api as lk_api
@@ -355,13 +450,19 @@ async def entrypoint(ctx: JobContext) -> None:
                     sip_participant_identity=sip_participant_identity,
                     transfer_to_number=transfer_to_number,
                 )
-            logger.info("Transfer to %s: %s. Summary: %s", transfer_to_number, success, summary)
+            log_event(
+                "transfer_attempted", call_id=call_id, business_id=business_id,
+                success=success, transfer_to_number=transfer_to_number,
+            )
             return success
-        except Exception:
-            logger.exception("Transfer attempt raised unexpectedly")
+        except Exception as e:
+            log_error(
+                "transfer_raised_exception", ErrorCategory.TELEPHONY_ERROR, str(e),
+                call_id=call_id, business_id=business_id,
+            )
             return False
 
-    agent = DhvaAgent(brain=brain, call_id=call_id, transfer_fn=transfer_fn)
+    agent = DhvaAgent(brain=brain, call_id=call_id, transfer_fn=transfer_fn, customer_id=customer_id)
 
     session = AgentSession(
         stt=build_stt(brain),
@@ -400,6 +501,11 @@ async def entrypoint(ctx: JobContext) -> None:
             needs_review=needs_review,
             review_reason=review_reason,
         )
+        log_event(
+            "call_finalized", call_id=call_id, business_id=business_id,
+            status=reason, outcome=outcome, duration_seconds=duration,
+            transferred=agent.transferred, needs_review=needs_review,
+        )
 
         summary_text, opportunity_saved = await generate_call_summary(
             transcript_lines=agent._transcript_lines,
@@ -422,8 +528,12 @@ async def entrypoint(ctx: JobContext) -> None:
             room_input_options=RoomInputOptions(),
         )
         await session.generate_reply(instructions=f"Greet the caller with: {brain.agent.greeting}")
-    except Exception:
-        logger.exception("Call failed to start cleanly for call_id=%s", call_id)
+    except Exception as e:
+        category = categorize_unknown_exception(e, context="session.start")
+        log_error(
+            "call_failed_to_start", category, str(e),
+            call_id=call_id, business_id=business_id,
+        )
         # Never let the caller hit dead air or a raw error — attempt one
         # last spoken message before tearing the session down. If even
         # this fails (e.g. TTS provider is also down), there's nothing
@@ -433,8 +543,11 @@ async def entrypoint(ctx: JobContext) -> None:
                 "I'm sorry, I'm having trouble connecting right now. "
                 "Please try calling back in a few minutes."
             )
-        except Exception:
-            logger.exception("Fallback spoken message also failed for call_id=%s", call_id)
+        except Exception as fallback_error:
+            log_error(
+                "fallback_spoken_message_also_failed", ErrorCategory.TTS_ERROR, str(fallback_error),
+                call_id=call_id, business_id=business_id,
+            )
         await _finalize("failed")
         return
 

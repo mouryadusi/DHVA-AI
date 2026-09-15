@@ -40,11 +40,18 @@ def classify_outcome(tool_calls: list[dict], transferred: bool) -> CallOutcome |
 
     if transferred:
         return "transferred"
-    if "calculate_order" in tool_names_succeeded:
+    if "place_order" in tool_names_succeeded:
         return "order_placed"
     if "take_message" in tool_names_succeeded:
         return "message_taken"
-    if tool_names_succeeded & {"get_business_hours", "get_business_info", "search_menu"}:
+    if tool_names_succeeded & {"get_business_hours", "get_business_info", "search_menu", "calculate_order"}:
+        # calculate_order deliberately lands here, not in order_placed: it's
+        # a price preview with no persisted side effect (see place_order for
+        # the tool that actually writes an order row) — a caller who got a
+        # quote and then didn't confirm was informationally helped, not sold
+        # anything. This was a real bug: calculate_order used to satisfy
+        # order_placed directly, so "Customer Opportunities Saved" could
+        # count calls where no order ever existed anywhere in the database.
         return "answered_faq"
     if not tool_calls:
         return "abandoned"

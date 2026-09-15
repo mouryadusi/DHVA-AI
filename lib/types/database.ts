@@ -327,6 +327,52 @@ export interface Database {
         };
         Update: never;
       };
+      orders: {
+        Row: {
+          id: string;
+          business_id: string;
+          call_id: string | null;
+          customer_id: string | null;
+          fulfillment_type: "pickup" | "delivery";
+          status: "received" | "confirmed" | "preparing" | "ready" | "completed" | "cancelled";
+          total_cents: number;
+          notes: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          business_id: string;
+          call_id?: string | null;
+          customer_id?: string | null;
+          fulfillment_type?: "pickup" | "delivery";
+          total_cents: number;
+          notes?: string | null;
+        };
+        Update: Partial<{
+          status: "received" | "confirmed" | "preparing" | "ready" | "completed" | "cancelled";
+          notes: string | null;
+        }>;
+      };
+      order_items: {
+        Row: {
+          id: string;
+          order_id: string;
+          product_id: string | null;
+          product_name: string;
+          unit_price_cents: number;
+          quantity: number;
+          line_total_cents: number;
+        };
+        Insert: {
+          order_id: string;
+          product_id?: string | null;
+          product_name: string;
+          unit_price_cents: number;
+          quantity: number;
+          line_total_cents: number;
+        };
+        Update: never;
+      };
     };
   };
 }

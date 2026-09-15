@@ -2,17 +2,28 @@ from src.outcome import classify_outcome, is_review_worthy_reason
 
 
 def test_transfer_takes_precedence():
-    calls = [{"tool_name": "calculate_order", "success": True}]
+    calls = [{"tool_name": "place_order", "success": True}]
     assert classify_outcome(calls, transferred=True) == "transferred"
 
 
-def test_order_placed():
-    calls = [{"tool_name": "search_menu", "success": True}, {"tool_name": "calculate_order", "success": True}]
+def test_order_placed_requires_the_real_persisting_tool():
+    calls = [{"tool_name": "search_menu", "success": True}, {"tool_name": "place_order", "success": True}]
     assert classify_outcome(calls, transferred=False) == "order_placed"
 
 
+def test_calculate_order_alone_is_not_order_placed():
+    # This is the fixed bug: calculate_order only ever computes a preview
+    # total and writes nothing to the database. A call where the caller
+    # got a quote and never confirmed must not be counted the same as one
+    # where a real order row exists — see agent/src/outcome.py's comment.
+    calls = [{"tool_name": "calculate_order", "success": True}]
+    result = classify_outcome(calls, transferred=False)
+    assert result != "order_placed"
+    assert result == "answered_faq"
+
+
 def test_failed_order_does_not_count():
-    calls = [{"tool_name": "calculate_order", "success": False}]
+    calls = [{"tool_name": "place_order", "success": False}]
     assert classify_outcome(calls, transferred=False) != "order_placed"
 
 

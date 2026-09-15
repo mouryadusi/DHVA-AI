@@ -11,6 +11,7 @@ out/
 agent/.env
 
 # Python
+.venv/
 agent/.venv/
 agent/__pycache__/
 agent/**/__pycache__/

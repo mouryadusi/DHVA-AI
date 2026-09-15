@@ -6,7 +6,7 @@ livekit-plugins-turn-detector~=1.5
 # after the streaming AgentSession has already ended — see that file's
 # module docstring for why it doesn't reuse the session's LLM plugin instance.
 anthropic~=0.40
-openai~=1.55
+openai>=2,<3
 
 supabase~=2.9
 pydantic~=2.9
